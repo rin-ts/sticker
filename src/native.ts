@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import type { OutlineOptions, RgbaColor } from "./types.ts";
 
@@ -61,8 +62,8 @@ export interface NativeStickerTranscodeOptions {
 
 export interface NativeStickerWorkerOptions {
   /**
-   * Path to the `sticker_worker` executable. It defaults to the native CMake
-   * output produced by `bun run build:native`.
+   * Path to the `sticker_worker` executable. It defaults to the installed
+   * platform worker package, or the local CMake output for a source checkout.
    */
   readonly workerPath?: string;
   /**
@@ -170,9 +171,38 @@ class BufferedReader {
   }
 }
 
+function platformWorkerPackage(): string | undefined {
+  if (process.platform !== "linux") {
+    return undefined;
+  }
+
+  if (process.arch === "x64") {
+    return "@rin-ts/sticker-linux-x64-gnu";
+  }
+  if (process.arch === "arm64") {
+    return "@rin-ts/sticker-linux-arm64-gnu";
+  }
+  return undefined;
+}
+
+function installedWorkerPath(executable: string): string | undefined {
+  const packageName = platformWorkerPackage();
+  if (packageName === undefined) {
+    return undefined;
+  }
+
+  try {
+    const manifestUrl = import.meta.resolve(`${packageName}/package.json`);
+    return resolve(fileURLToPath(manifestUrl), "..", "bin", executable);
+  } catch {
+    return undefined;
+  }
+}
+
 function defaultWorkerPath(): string {
   const executable = process.platform === "win32" ? "sticker_worker.exe" : "sticker_worker";
-  return resolve(import.meta.dir, "../build/native/bin", executable);
+  return installedWorkerPath(executable)
+    ?? resolve(import.meta.dir, "../build/native/bin", executable);
 }
 
 function requireByte(value: number, name: string): number {

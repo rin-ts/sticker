@@ -1,0 +1,25 @@
+{
+  "name": "@rin-ts/sticker-linux-x64-gnu",
+  "version": "0.1.0",
+  "description": "Prebuilt Linux x64 native worker for @rin-ts/sticker.",
+  "license": "GPL-3.0-only",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin/sticker_worker",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rin-ts/sticker.git",
+    "directory": "packages/sticker-linux-x64-gnu"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com",
+    "access": "public"
+  }
+}

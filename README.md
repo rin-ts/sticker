@@ -20,7 +20,25 @@ GIF, APNG, Lottie/Telegram `.tgs`, and transparent video (such as VP9/WebM)
 are currently rejected. They require dedicated native decoder adapters and
 are not silently converted through a browser canvas.
 
-## Install and build
+## Install
+
+Published packages include a prebuilt worker for Linux x64 and Linux ARM64.
+Configure GitHub Packages for the `@rin-ts` scope, then install normally:
+
+```ini
+# .npmrc
+@rin-ts:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}
+```
+
+```bash
+bun add @rin-ts/sticker
+```
+
+The optional platform worker is selected automatically. Set `workerPath` only
+when you supply a custom worker binary.
+
+## Build from source
 
 The native build requires Bun, CMake 3.20+, a C++20 compiler, `pkg-config`,
 and development packages for libpng, libjpeg, libwebp, libwebpmux, and
@@ -31,9 +49,7 @@ bun install
 bun run build:native
 ```
 
-This produces `build/native/bin/sticker_worker`. Deploy a worker compiled for
-the operating system and CPU that run Rin. Pass `workerPath` when the deployed
-binary is not at the package's default location.
+This produces `build/native/bin/sticker_worker`.
 
 ## Usage
 

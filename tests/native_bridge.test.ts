@@ -14,8 +14,8 @@ const onePixelPng = new Uint8Array(
   ),
 );
 
-test("native worker frames sequential WebP transcodes", async () => {
-  const worker = createNativeStickerWorker({ workerPath });
+test("native worker frames sequential WebP transcodes using the default local worker", async () => {
+  const worker = createNativeStickerWorker();
   try {
     const [plain, outlined] = await Promise.all([
       worker.transcode(onePixelPng),
