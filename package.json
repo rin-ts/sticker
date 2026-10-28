@@ -1,6 +1,6 @@
 {
   "name": "@rin-ts/sticker",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Native C++ WhatsApp WebP sticker worker for Rin.",
   "license": "GPL-3.0-only",
   "type": "module",
@@ -34,7 +34,7 @@
     "typescript": "^7"
   },
   "optionalDependencies": {
-    "@rin-ts/sticker-linux-arm64-gnu": "0.1.0",
-    "@rin-ts/sticker-linux-x64-gnu": "0.1.0"
+    "@rin-ts/sticker-linux-arm64-gnu": "0.1.1",
+    "@rin-ts/sticker-linux-x64-gnu": "0.1.1"
   }
 }

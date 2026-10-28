@@ -8,8 +8,8 @@
         "@types/bun": "latest",
       },
       "optionalDependencies": {
-        "@rin-ts/sticker-linux-arm64-gnu": "0.1.0",
-        "@rin-ts/sticker-linux-x64-gnu": "0.1.0",
+        "@rin-ts/sticker-linux-arm64-gnu": "0.1.1",
+        "@rin-ts/sticker-linux-x64-gnu": "0.1.1",
       },
       "peerDependencies": {
         "typescript": "^7",
