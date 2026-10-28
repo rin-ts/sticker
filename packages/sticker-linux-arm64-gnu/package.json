@@ -1,6 +1,6 @@
 {
   "name": "@rin-ts/sticker-linux-arm64-gnu",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Prebuilt Linux ARM64 native worker for @rin-ts/sticker.",
   "license": "GPL-3.0-only",
   "os": [
