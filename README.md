@@ -179,9 +179,12 @@ bun run test
 Maintain matching package versions and a `v<version>` tag, then run the
 repository’s **Publish packages** GitHub Actions workflow with the intended npm
 distribution tag. It publishes the platform packages before the main package
-and skips package versions already present on npm. Configure npm trusted
-publishers for the main and Linux platform packages after the initial release;
-the workflow file is [`release.yml`](.github/workflows/release.yml).
+and skips package versions already present on npm. Before publishing, configure
+an npm trusted publisher with `npm publish` permission for each of
+`@rin-ts/sticker`, `@rin-ts/sticker-linux-x64-gnu`, and
+`@rin-ts/sticker-linux-arm64-gnu`; use repository `rin-ts/sticker` and workflow
+file [`release.yml`](.github/workflows/release.yml). The workflow uses GitHub
+Actions OIDC, so it does not need an `NPM_TOKEN` secret.
 
 ## License
 
