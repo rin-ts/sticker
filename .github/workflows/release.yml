@@ -60,6 +60,7 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
+          registry-url: https://registry.npmjs.org
           package-manager-cache: false
       - name: Install native build dependencies
         run: |
@@ -76,13 +77,15 @@ jobs:
           install -m 0644 LICENSE "packages/sticker-${{ matrix.platform }}/LICENSE"
       - name: Publish platform package
         working-directory: packages/sticker-${{ matrix.platform }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           package_name="$(npm pkg get name | tr -d '"')"
           package_version="$(npm pkg get version | tr -d '"')"
           if npm view "${package_name}@${package_version}" version >/dev/null 2>&1; then
             echo "${package_name}@${package_version} is already published; skipping."
           else
-            npm publish --access public --tag "$DIST_TAG" --loglevel verbose
+            npm publish --access public --tag "$DIST_TAG"
           fi
 
   publish-main:
@@ -99,13 +102,16 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
+          registry-url: https://registry.npmjs.org
           package-manager-cache: false
       - name: Publish main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           package_name="$(npm pkg get name | tr -d '"')"
           package_version="$(npm pkg get version | tr -d '"')"
           if npm view "${package_name}@${package_version}" version >/dev/null 2>&1; then
             echo "${package_name}@${package_version} is already published; skipping."
           else
-            npm publish --access public --tag "$DIST_TAG" --loglevel verbose
+            npm publish --access public --tag "$DIST_TAG"
           fi
