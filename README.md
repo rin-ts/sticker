@@ -41,12 +41,15 @@ tag and the intended npm distribution tag. The workflow publishes the Linux
 packages before the main package and safely skips versions already on npm.
 GitHub requires repository write access to start this manual workflow.
 
-Before the first release, configure an npm trusted publisher for each package:
+After the initial release, configure an npm trusted publisher for each package:
 `@rin-ts/sticker`, `@rin-ts/sticker-linux-x64-gnu`, and
 `@rin-ts/sticker-linux-arm64-gnu`. Use GitHub organization `rin-ts`,
 repository `sticker`, workflow filename `release.yml`, and allow direct
 `npm publish`. This uses GitHub OIDC credentials rather than a stored npm
-token.
+token. npm requires a package to exist before it can be configured as a
+trusted publisher, so the initial release needs a temporary granular npm token
+in the `NPM_TOKEN` GitHub Actions secret. Revoke that token after the first
+release, then configure the trusted publishers shortly before the next release.
 
 ## Build from source
 

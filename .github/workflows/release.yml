@@ -77,6 +77,8 @@ jobs:
           install -m 0644 LICENSE "packages/sticker-${{ matrix.platform }}/LICENSE"
       - name: Publish platform package
         working-directory: packages/sticker-${{ matrix.platform }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           package_name="$(npm pkg get name | tr -d '"')"
           package_version="$(npm pkg get version | tr -d '"')"
@@ -103,6 +105,8 @@ jobs:
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
       - name: Publish main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           package_name="$(npm pkg get name | tr -d '"')"
           package_version="$(npm pkg get version | tr -d '"')"
