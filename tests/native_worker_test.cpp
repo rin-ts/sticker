@@ -1,6 +1,8 @@
 #include "sticker_pipeline.hpp"
 
+#include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -16,6 +18,10 @@
 
 extern "C" {
 #include <jpeglib.h>
+
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/mem.h>
 }
 
 namespace {
@@ -27,6 +33,33 @@ void require(const bool condition, const std::string &message) {
     throw std::runtime_error(message);
   }
 }
+
+struct AvFormatContextDeleter {
+  void operator()(AVFormatContext *const context) const noexcept {
+    avformat_free_context(context);
+  }
+};
+
+struct AvCodecContextDeleter {
+  void operator()(AVCodecContext *const context) const noexcept {
+    AVCodecContext *owned = context;
+    avcodec_free_context(&owned);
+  }
+};
+
+struct AvPacketDeleter {
+  void operator()(AVPacket *const packet) const noexcept {
+    AVPacket *owned = packet;
+    av_packet_free(&owned);
+  }
+};
+
+struct AvFrameDeleter {
+  void operator()(AVFrame *const frame) const noexcept {
+    AVFrame *owned = frame;
+    av_frame_free(&owned);
+  }
+};
 
 [[nodiscard]] std::vector<Byte> encode_static_source() {
   constexpr int kWidth = 4;
@@ -116,6 +149,108 @@ void require(const bool condition, const std::string &message) {
   const std::vector<Byte> result(owned_encoded.get(),
                                  owned_encoded.get() + encoded_size);
   return result;
+}
+
+void write_video_packets(AVFormatContext *const format,
+                         AVCodecContext *const encoder, AVStream *const stream,
+                         AVPacket *const packet) {
+  while (true) {
+    const int receive_status = avcodec_receive_packet(encoder, packet);
+    if (receive_status == AVERROR(EAGAIN) || receive_status == AVERROR_EOF) {
+      return;
+    }
+    require(receive_status >= 0, "failed to encode a video packet");
+    av_packet_rescale_ts(packet, encoder->time_base, stream->time_base);
+    packet->stream_index = stream->index;
+    const int write_status = av_interleaved_write_frame(format, packet);
+    av_packet_unref(packet);
+    require(write_status >= 0, "failed to mux a video packet");
+  }
+}
+
+[[nodiscard]] std::vector<Byte> encode_video_source() {
+  AVFormatContext *raw_format = nullptr;
+  require(avformat_alloc_output_context2(&raw_format, nullptr, "mp4",
+                                         nullptr) >= 0 &&
+              raw_format != nullptr,
+          "failed to allocate MP4 test output");
+  std::unique_ptr<AVFormatContext, AvFormatContextDeleter> format(raw_format);
+
+  const AVCodec *const codec = avcodec_find_encoder(AV_CODEC_ID_MPEG4);
+  require(codec != nullptr, "MPEG-4 test encoder is unavailable");
+  AVStream *const stream = avformat_new_stream(format.get(), nullptr);
+  require(stream != nullptr, "failed to allocate MP4 test stream");
+
+  std::unique_ptr<AVCodecContext, AvCodecContextDeleter> encoder(
+      avcodec_alloc_context3(codec));
+  require(encoder != nullptr, "failed to allocate video encoder context");
+  encoder->codec_id = codec->id;
+  encoder->codec_type = AVMEDIA_TYPE_VIDEO;
+  encoder->pix_fmt = AV_PIX_FMT_YUV420P;
+  encoder->width = 2;
+  encoder->height = 2;
+  encoder->time_base = AVRational{.num = 1, .den = 10};
+  encoder->framerate = AVRational{.num = 10, .den = 1};
+  encoder->gop_size = 3;
+  encoder->max_b_frames = 0;
+  if ((format->oformat->flags & AVFMT_GLOBALHEADER) != 0) {
+    encoder->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+  }
+  require(avcodec_open2(encoder.get(), codec, nullptr) >= 0,
+          "failed to open MPEG-4 test encoder");
+
+  stream->time_base = encoder->time_base;
+  require(avcodec_parameters_from_context(stream->codecpar, encoder.get()) >= 0,
+          "failed to copy video encoder parameters");
+  require(avio_open_dyn_buf(&format->pb) >= 0,
+          "failed to open in-memory MP4 output");
+  require(avformat_write_header(format.get(), nullptr) >= 0,
+          "failed to write MP4 test header");
+
+  std::unique_ptr<AVFrame, AvFrameDeleter> frame(av_frame_alloc());
+  std::unique_ptr<AVPacket, AvPacketDeleter> packet(av_packet_alloc());
+  require(frame != nullptr && packet != nullptr,
+          "failed to allocate video encoding buffers");
+  frame->format = encoder->pix_fmt;
+  frame->width = encoder->width;
+  frame->height = encoder->height;
+  require(av_frame_get_buffer(frame.get(), 0) >= 0,
+          "failed to allocate video test frame pixels");
+
+  constexpr std::array<std::array<Byte, 3U>, 3U> kYuvFrames = {
+      std::array<Byte, 3U>{76U, 84U, 255U},
+      std::array<Byte, 3U>{149U, 43U, 21U},
+      std::array<Byte, 3U>{29U, 255U, 107U},
+  };
+  for (std::size_t index = 0U; index < kYuvFrames.size(); ++index) {
+    require(av_frame_make_writable(frame.get()) >= 0,
+            "failed to make a video test frame writable");
+    for (int row = 0; row < encoder->height; ++row) {
+      const std::ptrdiff_t row_offset =
+          static_cast<std::ptrdiff_t>(row) * frame->linesize[0];
+      std::fill_n(frame->data[0] + row_offset, encoder->width,
+                  kYuvFrames[index][0]);
+    }
+    frame->data[1][0] = kYuvFrames[index][1];
+    frame->data[2][0] = kYuvFrames[index][2];
+    frame->pts = static_cast<std::int64_t>(index);
+    require(avcodec_send_frame(encoder.get(), frame.get()) >= 0,
+            "failed to send a video test frame to the encoder");
+    write_video_packets(format.get(), encoder.get(), stream, packet.get());
+  }
+  require(avcodec_send_frame(encoder.get(), nullptr) >= 0,
+          "failed to flush the video test encoder");
+  write_video_packets(format.get(), encoder.get(), stream, packet.get());
+  require(av_write_trailer(format.get()) >= 0,
+          "failed to write MP4 test trailer");
+
+  Byte *encoded = nullptr;
+  const int encoded_size = avio_close_dyn_buf(format->pb, &encoded);
+  format->pb = nullptr;
+  std::unique_ptr<Byte, decltype(&av_free)> owned_encoded(encoded, av_free);
+  require(encoded_size > 0 && owned_encoded != nullptr,
+          "failed to finalize MP4 test source");
+  return {owned_encoded.get(), owned_encoded.get() + encoded_size};
 }
 
 class Picture final {
@@ -256,6 +391,22 @@ void test_animated_transcode() {
           "animated output exceeds the WhatsApp size limit");
 }
 
+void test_video_transcode() {
+  const std::vector<Byte> source = encode_video_source();
+  const sticker::StickerResult result =
+      sticker::transcode(source, sticker::TranscodeOptions{.trim = false});
+  require(result.animated, "video source did not produce animated output");
+  require(result.width == 512U && result.height == 512U,
+          "video output dimensions are not 512 by 512");
+  require(result.frame_count > 1U, "video output has too few frames");
+  require(result.duration_ms == 200U,
+          "video output had " + std::to_string(result.frame_count) +
+              " frames and duration " + std::to_string(result.duration_ms) +
+              " ms instead of two frames and 200 ms");
+  require(result.bytes.size() <= static_cast<std::size_t>(500U) * 1024U,
+          "video output exceeds the WhatsApp size limit");
+}
+
 void test_edge_pixels_are_clamped_before_interpolation() {
   const std::vector<Byte> source = encode_two_color_source();
   const sticker::StickerResult result =
@@ -316,11 +467,12 @@ int main(const int argc, char *const argv[]) {
       std::string_view name;
       void (*run)();
     };
-    constexpr std::array<TestCase, 7U> kTestCases = {
+    constexpr std::array<TestCase, 8U> kTestCases = {
         TestCase{"static", test_static_transcode},
         TestCase{"jpeg", test_jpeg_transcode},
         TestCase{"malformed-jpeg", test_malformed_jpeg_is_rejected},
         TestCase{"animated", test_animated_transcode},
+        TestCase{"video", test_video_transcode},
         TestCase{"interpolation",
                  test_edge_pixels_are_clamped_before_interpolation},
         TestCase{"apng", test_apng_is_explicitly_rejected},

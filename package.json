@@ -18,7 +18,7 @@
   "bugs": "https://github.com/rin-ts/sticker/issues",
   "homepage": "https://github.com/rin-ts/sticker#readme",
   "publishConfig": {
-    "registry": "https://npm.pkg.github.com",
+    "registry": "https://registry.npmjs.org/",
     "access": "public"
   },
   "scripts": {

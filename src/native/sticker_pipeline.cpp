@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cmath>
 #include <csetjmp>
 #include <cstddef>
@@ -19,6 +20,14 @@
 
 extern "C" {
 #include <jpeglib.h>
+
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/error.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/mem.h>
+#include <libavutil/rational.h>
+#include <libswscale/swscale.h>
 }
 
 #include <png.h>
@@ -90,6 +99,17 @@ struct WebpInfo {
   [[nodiscard]] bool animated() const { return frame_durations_ms.size() > 1U; }
 };
 
+struct VideoInfo {
+  std::uint32_t width = 0U;
+  std::uint32_t height = 0U;
+  std::vector<std::uint32_t> frame_durations_ms;
+};
+
+struct VideoTiming {
+  std::int64_t stream_duration_ms = AV_NOPTS_VALUE;
+  std::uint32_t fallback_frame_duration_ms = kMinimumOutputFrameDurationMs;
+};
+
 struct FrameSelection {
   std::uint32_t source_index = 0U;
   std::uint32_t duration_ms = 0U;
@@ -123,6 +143,380 @@ struct AnimationPlan {
 
   return static_cast<std::size_t>(pixels) * 4U;
 }
+
+[[nodiscard]] std::string ffmpeg_error_message(const int error) {
+  std::array<char, AV_ERROR_MAX_STRING_SIZE> text{};
+  if (av_strerror(error, text.data(), text.size()) < 0) {
+    return "an unknown FFmpeg error";
+  }
+  return std::string(text.data());
+}
+
+struct VideoInput {
+  std::span<const Byte> bytes;
+  std::size_t offset = 0U;
+};
+
+[[nodiscard]] int read_video_input(void *const opaque,
+                                   std::uint8_t *const buffer,
+                                   const int buffer_size) noexcept {
+  auto *const input = static_cast<VideoInput *>(opaque);
+  if (input == nullptr || buffer == nullptr || buffer_size <= 0 ||
+      input->offset >= input->bytes.size()) {
+    return AVERROR_EOF;
+  }
+
+  const std::size_t requested = static_cast<std::size_t>(buffer_size);
+  const std::size_t available = input->bytes.size() - input->offset;
+  const std::size_t copied = std::min(requested, available);
+  std::memcpy(buffer, input->bytes.data() + input->offset, copied);
+  input->offset += copied;
+  return static_cast<int>(copied);
+}
+
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters): FFmpeg AVIO callback
+// ABI.
+[[nodiscard]] std::int64_t seek_video_input(void *const opaque,
+                                            const std::int64_t offset,
+                                            const int whence) noexcept {
+  auto *const input = static_cast<VideoInput *>(opaque);
+  if (input == nullptr) {
+    return AVERROR(EINVAL);
+  }
+
+  const int origin = whence & ~AVSEEK_FORCE;
+  if (origin == AVSEEK_SIZE) {
+    return static_cast<std::int64_t>(input->bytes.size());
+  }
+
+  std::int64_t base = 0;
+  switch (origin) {
+  case SEEK_SET:
+    base = 0;
+    break;
+  case SEEK_CUR:
+    base = static_cast<std::int64_t>(input->offset);
+    break;
+  case SEEK_END:
+    base = static_cast<std::int64_t>(input->bytes.size());
+    break;
+  default:
+    return AVERROR(EINVAL);
+  }
+
+  if (offset > 0 && offset > std::numeric_limits<std::int64_t>::max() - base) {
+    return AVERROR(EINVAL);
+  }
+  if (offset < 0 && offset < -base) {
+    return AVERROR(EINVAL);
+  }
+  const std::int64_t target = base + offset;
+  if (target < 0 || target > static_cast<std::int64_t>(input->bytes.size())) {
+    return AVERROR(EINVAL);
+  }
+  input->offset = static_cast<std::size_t>(target);
+  return target;
+}
+
+struct AvioContextDeleter {
+  void operator()(AVIOContext *const context) const noexcept {
+    AVIOContext *owned = context;
+    if (owned != nullptr) {
+      av_freep(static_cast<void *>(&owned->buffer));
+    }
+    avio_context_free(&owned);
+  }
+};
+
+struct FormatContextDeleter {
+  void operator()(AVFormatContext *const context) const noexcept {
+    AVFormatContext *owned = context;
+    avformat_close_input(&owned);
+  }
+};
+
+struct CodecContextDeleter {
+  void operator()(AVCodecContext *const context) const noexcept {
+    AVCodecContext *owned = context;
+    avcodec_free_context(&owned);
+  }
+};
+
+struct PacketDeleter {
+  void operator()(AVPacket *const packet) const noexcept {
+    AVPacket *owned = packet;
+    av_packet_free(&owned);
+  }
+};
+
+struct FrameDeleter {
+  void operator()(AVFrame *const frame) const noexcept {
+    AVFrame *owned = frame;
+    av_frame_free(&owned);
+  }
+};
+
+struct ScalerDeleter {
+  void operator()(SwsContext *const context) const noexcept {
+    sws_freeContext(context);
+  }
+};
+
+class VideoDecoder final {
+public:
+  explicit VideoDecoder(const std::span<const Byte> source)
+      : input_{.bytes = source} {
+    constexpr int kAvioBufferBytes = 4096;
+    Byte *const avio_buffer = static_cast<Byte *>(av_malloc(kAvioBufferBytes));
+    if (avio_buffer == nullptr) {
+      fail(ErrorCode::kResourceLimit,
+           "unable to allocate a video input buffer");
+    }
+    AVIOContext *const avio =
+        avio_alloc_context(avio_buffer, kAvioBufferBytes, 0, &input_,
+                           read_video_input, nullptr, seek_video_input);
+    if (avio == nullptr) {
+      av_free(avio_buffer);
+      fail(ErrorCode::kResourceLimit,
+           "unable to initialize video input buffering");
+    }
+    avio_.reset(avio);
+
+    AVFormatContext *format = avformat_alloc_context();
+    if (format == nullptr) {
+      fail(ErrorCode::kResourceLimit,
+           "unable to allocate a video format context");
+    }
+    format->pb = avio_.get();
+    format->flags |= AVFMT_FLAG_CUSTOM_IO;
+    const int open_status =
+        avformat_open_input(&format, nullptr, nullptr, nullptr);
+    if (open_status < 0) {
+      if (format != nullptr) {
+        avformat_free_context(format);
+      }
+      fail(ErrorCode::kUnsupportedInput,
+           "unsupported video input: " + ffmpeg_error_message(open_status));
+    }
+    format_.reset(format);
+
+    const int stream_info_status =
+        avformat_find_stream_info(format_.get(), nullptr);
+    if (stream_info_status < 0) {
+      fail(ErrorCode::kInvalidInput,
+           "unable to read video stream information: " +
+               ffmpeg_error_message(stream_info_status));
+    }
+    video_stream_index_ = av_find_best_stream(format_.get(), AVMEDIA_TYPE_VIDEO,
+                                              -1, -1, nullptr, 0);
+    if (video_stream_index_ < 0) {
+      fail(ErrorCode::kUnsupportedInput,
+           "input does not contain a decodable video stream");
+    }
+
+    stream_ = format_->streams[static_cast<std::size_t>(video_stream_index_)];
+    const AVCodec *const codec =
+        avcodec_find_decoder(stream_->codecpar->codec_id);
+    if (codec == nullptr) {
+      fail(ErrorCode::kUnsupportedInput,
+           "video stream uses an unsupported codec");
+    }
+
+    codec_.reset(avcodec_alloc_context3(codec));
+    if (codec_ == nullptr) {
+      fail(ErrorCode::kResourceLimit,
+           "unable to allocate a video decoder context");
+    }
+    const int parameters_status =
+        avcodec_parameters_to_context(codec_.get(), stream_->codecpar);
+    if (parameters_status < 0) {
+      fail(ErrorCode::kInvalidInput,
+           "unable to read video codec parameters: " +
+               ffmpeg_error_message(parameters_status));
+    }
+    const int codec_status = avcodec_open2(codec_.get(), codec, nullptr);
+    if (codec_status < 0) {
+      fail(ErrorCode::kUnsupportedInput,
+           "unable to initialize the video decoder: " +
+               ffmpeg_error_message(codec_status));
+    }
+
+    if (codec_->width <= 0 || codec_->height <= 0) {
+      fail(ErrorCode::kInvalidInput,
+           "video stream does not declare valid dimensions");
+    }
+    dimensions_ = FrameDimensions{
+        .width = static_cast<std::uint32_t>(codec_->width),
+        .height = static_cast<std::uint32_t>(codec_->height),
+    };
+    static_cast<void>(
+        checked_pixel_bytes(dimensions_.width, dimensions_.height));
+
+    packet_.reset(av_packet_alloc());
+    frame_.reset(av_frame_alloc());
+    if (packet_ == nullptr || frame_ == nullptr) {
+      fail(ErrorCode::kResourceLimit,
+           "unable to allocate video decoder buffers");
+    }
+
+    time_base_ = stream_->time_base;
+    frame_rate_ = av_guess_frame_rate(format_.get(), stream_, nullptr);
+    stream_duration_ = stream_->duration;
+  }
+
+  VideoDecoder(const VideoDecoder &) = delete;
+  VideoDecoder &operator=(const VideoDecoder &) = delete;
+  VideoDecoder(VideoDecoder &&) = delete;
+  VideoDecoder &operator=(VideoDecoder &&) = delete;
+
+  [[nodiscard]] FrameDimensions dimensions() const noexcept {
+    return dimensions_;
+  }
+
+  [[nodiscard]] std::uint32_t default_frame_duration_ms() const {
+    if (frame_rate_.num <= 0 || frame_rate_.den <= 0) {
+      return kMinimumOutputFrameDurationMs;
+    }
+    const AVRational milliseconds = {.num = 1, .den = 1000};
+    const std::int64_t duration =
+        av_rescale_q(1, av_inv_q(frame_rate_), milliseconds);
+    if (duration <= 0) {
+      return 1U;
+    }
+    return static_cast<std::uint32_t>(
+        std::min(duration, static_cast<std::int64_t>(1000)));
+  }
+
+  [[nodiscard]] std::int64_t stream_duration_ms() const {
+    if (stream_duration_ == AV_NOPTS_VALUE) {
+      return AV_NOPTS_VALUE;
+    }
+    const AVRational milliseconds = {.num = 1, .den = 1000};
+    return av_rescale_q(stream_duration_, time_base_, milliseconds);
+  }
+
+  template <typename Callback> void visit_decoded_frames(Callback &&callback) {
+    while (true) {
+      const int read_status = av_read_frame(format_.get(), packet_.get());
+      if (read_status == AVERROR_EOF) {
+        break;
+      }
+      if (read_status < 0) {
+        fail(ErrorCode::kInvalidInput, "unable to read a video packet: " +
+                                           ffmpeg_error_message(read_status));
+      }
+
+      if (packet_->stream_index == video_stream_index_) {
+        send_packet(packet_.get(), callback);
+      }
+      av_packet_unref(packet_.get());
+    }
+    send_packet(nullptr, callback);
+  }
+
+  [[nodiscard]] Image convert_to_rgba(const AVFrame &frame) {
+    if (frame.width != static_cast<int>(dimensions_.width) ||
+        frame.height != static_cast<int>(dimensions_.height) ||
+        frame.format < 0) {
+      fail(ErrorCode::kInvalidInput,
+           "video frame dimensions or pixel format changed during decoding");
+    }
+    const AVPixelFormat source_format =
+        static_cast<AVPixelFormat>(frame.format);
+    if (scaler_ == nullptr || source_format != scaler_source_format_) {
+      scaler_.reset(sws_getContext(frame.width, frame.height, source_format,
+                                   frame.width, frame.height, AV_PIX_FMT_RGBA,
+                                   SWS_BILINEAR, nullptr, nullptr, nullptr));
+      if (scaler_ == nullptr) {
+        fail(ErrorCode::kUnsupportedInput,
+             "unable to convert the video pixel format to RGBA");
+      }
+      scaler_source_format_ = source_format;
+    }
+
+    Image image{
+        .width = dimensions_.width,
+        .height = dimensions_.height,
+        .rgba = std::vector<Byte>(
+            checked_pixel_bytes(dimensions_.width, dimensions_.height)),
+    };
+    std::array<Byte *, 4U> destination = {nullptr, nullptr, nullptr, nullptr};
+    std::array<int, 4U> destination_stride = {0, 0, 0, 0};
+    const int destination_size = av_image_alloc(
+        destination.data(), destination_stride.data(),
+        static_cast<int>(dimensions_.width),
+        static_cast<int>(dimensions_.height), AV_PIX_FMT_RGBA, 32);
+    if (destination_size < 0 || destination[0] == nullptr) {
+      fail(ErrorCode::kResourceLimit,
+           "unable to allocate an aligned video RGBA frame");
+    }
+    std::unique_ptr<Byte, decltype(&av_free)> owned_destination(destination[0],
+                                                                av_free);
+    const int converted =
+        sws_scale(scaler_.get(), frame.data, frame.linesize, 0, frame.height,
+                  destination.data(), destination_stride.data());
+    if (converted != frame.height) {
+      fail(ErrorCode::kInvalidInput,
+           "unable to convert a decoded video frame to RGBA");
+    }
+    for (std::uint32_t row = 0U; row < dimensions_.height; ++row) {
+      std::memcpy(image.rgba.data() +
+                      static_cast<std::size_t>(row) * dimensions_.width * 4U,
+                  destination[0] +
+                      static_cast<std::size_t>(row) *
+                          static_cast<std::size_t>(destination_stride[0]),
+                  static_cast<std::size_t>(dimensions_.width) * 4U);
+    }
+    return image;
+  }
+
+private:
+  template <typename Callback>
+  void send_packet(const AVPacket *const packet, Callback &&callback) {
+    const int send_status = avcodec_send_packet(codec_.get(), packet);
+    if (send_status < 0) {
+      fail(ErrorCode::kInvalidInput,
+           "unable to send a video packet to the decoder: " +
+               ffmpeg_error_message(send_status));
+    }
+
+    while (true) {
+      const int receive_status =
+          avcodec_receive_frame(codec_.get(), frame_.get());
+      if (receive_status == AVERROR(EAGAIN) || receive_status == AVERROR_EOF) {
+        return;
+      }
+      if (receive_status < 0) {
+        fail(ErrorCode::kInvalidInput,
+             "unable to decode a video frame: " +
+                 ffmpeg_error_message(receive_status));
+      }
+
+      std::int64_t timestamp = frame_->best_effort_timestamp;
+      if (timestamp != AV_NOPTS_VALUE) {
+        const AVRational milliseconds = {.num = 1, .den = 1000};
+        timestamp = av_rescale_q(timestamp, time_base_, milliseconds);
+      }
+      callback(*frame_, timestamp);
+      av_frame_unref(frame_.get());
+    }
+  }
+
+  VideoInput input_;
+  std::unique_ptr<AVIOContext, AvioContextDeleter> avio_;
+  std::unique_ptr<AVFormatContext, FormatContextDeleter> format_;
+  std::unique_ptr<AVCodecContext, CodecContextDeleter> codec_;
+  std::unique_ptr<AVPacket, PacketDeleter> packet_;
+  std::unique_ptr<AVFrame, FrameDeleter> frame_;
+  std::unique_ptr<SwsContext, ScalerDeleter> scaler_;
+  AVStream *stream_ = nullptr;
+  FrameDimensions dimensions_{};
+  AVRational time_base_{};
+  AVRational frame_rate_{};
+  std::int64_t stream_duration_ = AV_NOPTS_VALUE;
+  int video_stream_index_ = -1;
+  AVPixelFormat scaler_source_format_ = AV_PIX_FMT_NONE;
+};
 
 [[nodiscard]] std::size_t pixel_offset(const std::uint32_t x,
                                        const std::uint32_t y,
@@ -180,6 +574,12 @@ read_big_endian_u32(const std::span<const Byte> bytes,
 [[nodiscard]] bool is_jpeg(const std::span<const Byte> bytes) {
   return bytes.size() >= 3U && bytes[0] == 0xffU && bytes[1] == 0xd8U &&
          bytes[2] == 0xffU;
+}
+
+[[nodiscard]] bool is_gif(const std::span<const Byte> bytes) {
+  constexpr std::array<Byte, 6U> kGif87a = {'G', 'I', 'F', '8', '7', 'a'};
+  constexpr std::array<Byte, 6U> kGif89a = {'G', 'I', 'F', '8', '9', 'a'};
+  return starts_with(bytes, kGif87a) || starts_with(bytes, kGif89a);
 }
 
 [[nodiscard]] bool is_webp(const std::span<const Byte> bytes) {
@@ -470,6 +870,142 @@ void visit_animation_frames(const std::span<const Byte> bytes,
   if (index != info.frame_durations_ms.size()) {
     fail(ErrorCode::kInvalidInput,
          "WebP animation frame count changed during decode");
+  }
+}
+
+[[nodiscard]] std::vector<std::uint32_t>
+video_frame_durations(const std::vector<std::int64_t> &timestamps,
+                      const VideoTiming timing) {
+  if (timestamps.empty()) {
+    fail(ErrorCode::kInvalidInput, "video stream has no decoded frames");
+  }
+
+  std::vector<std::uint32_t> durations(timestamps.size(),
+                                       timing.fallback_frame_duration_ms);
+  std::uint64_t total_duration_ms = 0U;
+  for (std::size_t index = 0U; index < timestamps.size(); ++index) {
+    std::int64_t duration =
+        static_cast<std::int64_t>(timing.fallback_frame_duration_ms);
+    if (index + 1U < timestamps.size()) {
+      duration = timestamps[index + 1U] - timestamps[index];
+    } else if (timing.stream_duration_ms > timestamps[index]) {
+      duration = timing.stream_duration_ms - timestamps[index];
+    }
+    if (duration <= 0) {
+      duration = static_cast<std::int64_t>(timing.fallback_frame_duration_ms);
+    }
+    if (duration > static_cast<std::int64_t>(kMaxAnimationDurationMs)) {
+      fail(ErrorCode::kResourceLimit,
+           "video frame duration exceeds the native worker limit");
+    }
+
+    total_duration_ms += static_cast<std::uint64_t>(duration);
+    if (total_duration_ms > kMaxAnimationDurationMs) {
+      fail(ErrorCode::kResourceLimit,
+           "video duration exceeds the WhatsApp duration limit");
+    }
+    durations[index] = static_cast<std::uint32_t>(duration);
+  }
+  return durations;
+}
+
+[[nodiscard]] VideoInfo inspect_video(const std::span<const Byte> source) {
+  VideoDecoder decoder(source);
+  const FrameDimensions dimensions = decoder.dimensions();
+  const std::uint64_t source_pixels =
+      static_cast<std::uint64_t>(dimensions.width) * dimensions.height;
+  const std::uint32_t fallback_duration_ms =
+      decoder.default_frame_duration_ms();
+
+  std::vector<std::int64_t> timestamps;
+  timestamps.reserve(kMaxInputFrames);
+  bool has_timestamp_origin = false;
+  std::int64_t timestamp_origin = 0;
+  std::int64_t previous_timestamp = 0;
+
+  decoder.visit_decoded_frames([&](const AVFrame &frame,
+                                   const std::int64_t timestamp) {
+    if (frame.width != static_cast<int>(dimensions.width) ||
+        frame.height != static_cast<int>(dimensions.height)) {
+      fail(ErrorCode::kInvalidInput,
+           "video frame dimensions changed during decoding");
+    }
+    if (timestamps.size() >= kMaxInputFrames ||
+        static_cast<std::uint64_t>(timestamps.size() + 1U) >
+            kMaxAnimationSourcePixels / source_pixels) {
+      fail(ErrorCode::kResourceLimit,
+           "video animation exceeds the native worker frame or pixel limit");
+    }
+
+    std::int64_t normalized = 0;
+    if (timestamp != AV_NOPTS_VALUE) {
+      if (!has_timestamp_origin) {
+        timestamp_origin = timestamp;
+        has_timestamp_origin = true;
+      }
+      if (timestamp >= timestamp_origin) {
+        if (timestamp_origin < 0 &&
+            timestamp >
+                std::numeric_limits<std::int64_t>::max() + timestamp_origin) {
+          fail(ErrorCode::kInvalidInput,
+               "video frame timestamps exceed the native worker range");
+        }
+        normalized = timestamp - timestamp_origin;
+      }
+    }
+    if (!timestamps.empty()) {
+      if (timestamp == AV_NOPTS_VALUE || normalized <= previous_timestamp) {
+        if (previous_timestamp >
+            std::numeric_limits<std::int64_t>::max() -
+                static_cast<std::int64_t>(fallback_duration_ms)) {
+          fail(ErrorCode::kInvalidInput,
+               "video frame timestamps overflow the native worker range");
+        }
+        normalized = previous_timestamp +
+                     static_cast<std::int64_t>(fallback_duration_ms);
+      }
+    }
+    timestamps.push_back(normalized);
+    previous_timestamp = normalized;
+  });
+
+  return VideoInfo{
+      .width = dimensions.width,
+      .height = dimensions.height,
+      .frame_durations_ms = video_frame_durations(
+          timestamps,
+          VideoTiming{
+              .stream_duration_ms = decoder.stream_duration_ms(),
+              .fallback_frame_duration_ms = fallback_duration_ms,
+          }),
+  };
+}
+
+template <typename Callback>
+void visit_video_frames(const std::span<const Byte> source,
+                        const VideoInfo &info, Callback &&callback) {
+  VideoDecoder decoder(source);
+  const FrameDimensions dimensions = decoder.dimensions();
+  if (dimensions.width != info.width || dimensions.height != info.height) {
+    fail(ErrorCode::kInvalidInput,
+         "video dimensions changed between decoding passes");
+  }
+
+  std::uint32_t index = 0U;
+  decoder.visit_decoded_frames(
+      [&](const AVFrame &frame, const std::int64_t timestamp) {
+        static_cast<void>(timestamp);
+        if (index >= info.frame_durations_ms.size()) {
+          fail(ErrorCode::kInvalidInput,
+               "video frame count changed between decoding passes");
+        }
+        const Image rgba = decoder.convert_to_rgba(frame);
+        callback(index, std::span<const Byte>(rgba.rgba));
+        ++index;
+      });
+  if (index != info.frame_durations_ms.size()) {
+    fail(ErrorCode::kInvalidInput,
+         "video frame count changed between decoding passes");
   }
 }
 
@@ -1093,6 +1629,167 @@ encode_animation_limited(const std::span<const Byte> source,
        "unable to fit the animated sticker inside the WhatsApp size limit");
 }
 
+[[nodiscard]] AnimationPlan
+plan_video_animation(const std::span<const Byte> source, const VideoInfo &info,
+                     const TranscodeOptions &options) {
+  Bounds bounds{};
+  std::vector<FrameSelection> selections;
+  selections.reserve(info.frame_durations_ms.size());
+  std::uint64_t duration_ms = 0U;
+
+  visit_video_frames(
+      source, info,
+      [&](const std::uint32_t index, const std::span<const Byte> frame) {
+        extend_bounds(bounds, frame,
+                      FrameDimensions{
+                          .width = info.width,
+                          .height = info.height,
+                      },
+                      options.alpha_threshold);
+        std::uint32_t frame_duration = info.frame_durations_ms[index];
+        if (frame_duration == 0U) {
+          frame_duration = kMinimumOutputFrameDurationMs;
+        }
+        duration_ms += frame_duration;
+        if (duration_ms > kMaxAnimationDurationMs) {
+          fail(ErrorCode::kResourceLimit,
+               "video duration exceeds the WhatsApp duration limit");
+        }
+
+        if (selections.empty() ||
+            selections.back().duration_ms >= kMinimumOutputFrameDurationMs) {
+          selections.push_back(FrameSelection{
+              .source_index = index,
+              .duration_ms = frame_duration,
+          });
+        } else {
+          selections.back().duration_ms += frame_duration;
+        }
+      });
+
+  if (selections.size() > 1U &&
+      selections.back().duration_ms < kMinimumOutputFrameDurationMs) {
+    selections[selections.size() - 2U].duration_ms +=
+        selections.back().duration_ms;
+    selections.pop_back();
+  }
+  if (selections.empty()) {
+    fail(ErrorCode::kInvalidInput, "video animation has no frames");
+  }
+
+  return AnimationPlan{
+      .geometry = make_geometry_plan(bounds, info.width, info.height, options),
+      .selections = std::move(selections),
+      .duration_ms = static_cast<std::uint32_t>(duration_ms),
+  };
+}
+
+[[nodiscard]] Image
+render_video_animation_frame(const std::span<const Byte> source,
+                             const VideoInfo &info, const AnimationPlan &plan,
+                             const std::uint32_t wanted_index,
+                             const TranscodeOptions &options) {
+  Image rendered{};
+  bool found = false;
+  visit_video_frames(
+      source, info,
+      [&](const std::uint32_t index, const std::span<const Byte> frame) {
+        if (index != wanted_index) {
+          return;
+        }
+        rendered = render_frame(frame, info.width, info.height, plan.geometry);
+        apply_outline(rendered, options);
+        found = true;
+      });
+  if (!found) {
+    fail(ErrorCode::kInvalidInput, "requested video frame is unavailable");
+  }
+  return rendered;
+}
+
+[[nodiscard]] std::vector<Byte>
+encode_video_animation(const std::span<const Byte> source,
+                       const VideoInfo &info, const AnimationPlan &plan,
+                       const TranscodeOptions &options, const int quality) {
+  WebPAnimEncoderOptions encoder_options{};
+  if (WebPAnimEncoderOptionsInit(&encoder_options) == 0) {
+    fail(ErrorCode::kInternal, "unable to initialize the animation encoder");
+  }
+  encoder_options.anim_params.bgcolor = 0U;
+  encoder_options.anim_params.loop_count = 0;
+  encoder_options.minimize_size = 0;
+  encoder_options.allow_mixed = 1;
+
+  using EncoderPtr =
+      std::unique_ptr<WebPAnimEncoder, decltype(&WebPAnimEncoderDelete)>;
+  EncoderPtr encoder(WebPAnimEncoderNew(static_cast<int>(kCanvasSize),
+                                        static_cast<int>(kCanvasSize),
+                                        &encoder_options),
+                     WebPAnimEncoderDelete);
+  if (!encoder) {
+    fail(ErrorCode::kEncodingFailed, "unable to create the animation encoder");
+  }
+
+  WebPConfig config = make_webp_config(quality, false);
+  std::size_t selection_index = 0U;
+  std::uint32_t timestamp_ms = 0U;
+  visit_video_frames(
+      source, info,
+      [&](const std::uint32_t index, const std::span<const Byte> frame) {
+        if (selection_index >= plan.selections.size() ||
+            plan.selections[selection_index].source_index != index) {
+          return;
+        }
+
+        Image rendered =
+            render_frame(frame, info.width, info.height, plan.geometry);
+        apply_outline(rendered, options);
+        Picture picture;
+        picture.import_rgba(rendered);
+        if (WebPAnimEncoderAdd(encoder.get(), picture.get(),
+                               static_cast<int>(timestamp_ms), &config) == 0) {
+          fail(ErrorCode::kEncodingFailed,
+               "unable to encode a video animation frame");
+        }
+        timestamp_ms += plan.selections[selection_index].duration_ms;
+        ++selection_index;
+      });
+
+  if (selection_index != plan.selections.size()) {
+    fail(ErrorCode::kInvalidInput,
+         "video frame selection could not be reconstructed");
+  }
+  if (WebPAnimEncoderAdd(encoder.get(), nullptr, static_cast<int>(timestamp_ms),
+                         nullptr) == 0) {
+    fail(ErrorCode::kEncodingFailed,
+         "unable to finalize the video animation timing");
+  }
+
+  EncodedData encoded;
+  if (WebPAnimEncoderAssemble(encoder.get(), encoded.get()) == 0) {
+    fail(ErrorCode::kEncodingFailed,
+         "unable to assemble animated WebP video output");
+  }
+  return encoded.copy();
+}
+
+[[nodiscard]] StickerResult
+encode_video_animation_limited(const std::span<const Byte> source,
+                               const VideoInfo &info, const AnimationPlan &plan,
+                               const TranscodeOptions &options) {
+  constexpr std::array<int, 9U> kQualityCandidates = {90, 80, 70, 60, 50,
+                                                      40, 30, 20, 10};
+  for (const int quality : kQualityCandidates) {
+    std::vector<Byte> encoded =
+        encode_video_animation(source, info, plan, options, quality);
+    if (encoded.size() <= kMaximumAnimatedStickerBytes) {
+      return validate_output(std::move(encoded), true);
+    }
+  }
+  fail(ErrorCode::kEncodingFailed,
+       "unable to fit the video sticker inside the WhatsApp size limit");
+}
+
 [[nodiscard]] StickerResult transcode_static(Image decoded,
                                              const TranscodeOptions &options) {
   Bounds bounds{};
@@ -1119,6 +1816,18 @@ transcode_animated_webp(const std::span<const Byte> source,
         source, info, plan, plan.selections.front().source_index, options));
   }
   return encode_animation_limited(source, info, plan, options);
+}
+
+[[nodiscard]] StickerResult
+transcode_animated_video(const std::span<const Byte> source,
+                         const VideoInfo &info,
+                         const TranscodeOptions &options) {
+  const AnimationPlan plan = plan_video_animation(source, info, options);
+  if (plan.selections.size() == 1U) {
+    return encode_static_limited(render_video_animation_frame(
+        source, info, plan, plan.selections.front().source_index, options));
+  }
+  return encode_video_animation_limited(source, info, plan, options);
 }
 
 } // namespace
@@ -1155,8 +1864,11 @@ StickerResult transcode(const std::span<const std::uint8_t> source,
     if (is_jpeg(source)) {
       return transcode_static(decode_jpeg(source), options);
     }
-    fail(ErrorCode::kUnsupportedInput,
-         "unsupported sticker input; use PNG, JPEG, or WebP");
+    if (is_gif(source)) {
+      fail(ErrorCode::kUnsupportedInput,
+           "GIF input is not supported; use a video or animated WebP instead");
+    }
+    return transcode_animated_video(source, inspect_video(source), options);
   } catch (const StickerError &) {
     throw;
   } catch (const std::bad_alloc &) {

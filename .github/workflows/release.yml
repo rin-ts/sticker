@@ -1,24 +1,38 @@
 name: Publish packages
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing version tag to publish (for example v0.1.1)"
+        required: true
+        type: string
+      dist_tag:
+        description: "npm distribution tag"
+        required: true
+        default: latest
+        type: string
 
 permissions:
   contents: read
-  packages: write
+  id-token: write
 
 jobs:
   verify-version:
     runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag }}
+          fetch-depth: 0
       - uses: oven-sh/setup-bun@v2
       - name: Require a matching version tag
         run: |
+          git rev-parse --verify --quiet "refs/tags/${RELEASE_TAG}^{commit}" >/dev/null
           version="$(bun -e 'console.log(JSON.parse(await Bun.file("package.json").text()).version)')"
-          test "v${version}" = "${GITHUB_REF_NAME}"
+          test "v${version}" = "${RELEASE_TAG}"
           for manifest in packages/*/package.json; do
             package_version="$(bun -e 'console.log(JSON.parse(await Bun.file(process.argv[1]).text()).version)' "$manifest")"
             test "$package_version" = "$version"
@@ -35,13 +49,23 @@ jobs:
           - runner: ubuntu-24.04-arm
             platform: linux-arm64-gnu
     runs-on: ${{ matrix.runner }}
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      DIST_TAG: ${{ inputs.dist_tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag }}
       - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes cmake pkg-config libpng-dev libjpeg-dev libwebp-dev
+          sudo apt-get install --yes cmake pkg-config libpng-dev libjpeg-dev libwebp-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
       - name: Install Bun dependencies
         run: bun install --frozen-lockfile
       - name: Build and test worker
@@ -53,25 +77,37 @@ jobs:
           install -m 0644 LICENSE "packages/sticker-${{ matrix.platform }}/LICENSE"
       - name: Publish platform package
         working-directory: packages/sticker-${{ matrix.platform }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          printf '//npm.pkg.github.com/:_authToken=%s\n' "$NODE_AUTH_TOKEN" \
-            > "$RUNNER_TEMP/.npmrc"
-          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/.npmrc" \
-            bun publish --access public --tolerate-republish
+          package_name="$(npm pkg get name | tr -d '"')"
+          package_version="$(npm pkg get version | tr -d '"')"
+          if npm view "${package_name}@${package_version}" version >/dev/null 2>&1; then
+            echo "${package_name}@${package_version} is already published; skipping."
+          else
+            npm publish --access public --tag "$DIST_TAG"
+          fi
 
   publish-main:
     needs: publish-platform
     runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      DIST_TAG: ${{ inputs.dist_tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag }}
       - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
       - name: Publish main package
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          printf '//npm.pkg.github.com/:_authToken=%s\n' "$NODE_AUTH_TOKEN" \
-            > "$RUNNER_TEMP/.npmrc"
-          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/.npmrc" \
-            bun publish --access public --tolerate-republish
+          package_name="$(npm pkg get name | tr -d '"')"
+          package_version="$(npm pkg get version | tr -d '"')"
+          if npm view "${package_name}@${package_version}" version >/dev/null 2>&1; then
+            echo "${package_name}@${package_version} is already published; skipping."
+          else
+            npm publish --access public --tag "$DIST_TAG"
+          fi

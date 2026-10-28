@@ -11,25 +11,20 @@ accepted.
 
 ## Supported media
 
-- PNG, JPEG, static WebP, and animated WebP
+- PNG, JPEG, static WebP, animated WebP, and videos decoded by FFmpeg
+  (including MP4, MOV, WebM, MKV, and AVI)
 - Transparency, alpha trimming, proportional 512 × 512 sizing, and optional
   alpha-aware outlines
 - Static and animated WhatsApp-compatible WebP output
 
-GIF, APNG, Lottie/Telegram `.tgs`, and transparent video (such as VP9/WebM)
-are currently rejected. They require dedicated native decoder adapters and
-are not silently converted through a browser canvas.
+GIF, APNG, and Lottie/Telegram `.tgs` remain rejected. Videos are decoded
+directly from the supplied bytes; audio streams are ignored.
 
 ## Install
 
 Published packages include a prebuilt worker for Linux x64 and Linux ARM64.
-Configure GitHub Packages for the `@rin-ts` scope, then install normally:
-
-```ini
-# .npmrc
-@rin-ts:registry=https://npm.pkg.github.com
-//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}
-```
+They are available from the public npm registry, so no registry configuration
+or authentication is needed.
 
 ```bash
 bun add @rin-ts/sticker
@@ -38,11 +33,27 @@ bun add @rin-ts/sticker
 The optional platform worker is selected automatically. Set `workerPath` only
 when you supply a custom worker binary.
 
+## Publishing
+
+Maintain a matching `v<version>` Git tag and package versions, then a
+maintainer runs the **Publish packages** workflow from GitHub Actions with that
+tag and the intended npm distribution tag. The workflow publishes the Linux
+packages before the main package and safely skips versions already on npm.
+GitHub requires repository write access to start this manual workflow.
+
+Before the first release, configure an npm trusted publisher for each package:
+`@rin-ts/sticker`, `@rin-ts/sticker-linux-x64-gnu`, and
+`@rin-ts/sticker-linux-arm64-gnu`. Use GitHub organization `rin-ts`,
+repository `sticker`, workflow filename `release.yml`, and allow direct
+`npm publish`. This uses GitHub OIDC credentials rather than a stored npm
+token.
+
 ## Build from source
 
 The native build requires Bun, CMake 3.20+, a C++20 compiler, `pkg-config`,
-and development packages for libpng, libjpeg, libwebp, libwebpmux, and
-libwebpdemux.
+and development packages for libpng, libjpeg, libwebp, libwebpmux,
+libwebpdemux, libavformat, libavcodec, libavutil, and libswscale. On Void,
+install these FFmpeg headers with `sudo xbps-install -S ffmpeg6-devel`.
 
 ```bash
 bun install

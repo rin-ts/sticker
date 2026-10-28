@@ -54,9 +54,9 @@ struct StickerResult {
 /**
  * Converts a supported source asset into a WhatsApp-compatible WebP sticker.
  *
- * Supported sources in this first native core are PNG, JPEG, static WebP, and
- * animated WebP. The caller owns the source bytes; the returned value owns the
- * encoded output bytes.
+ * Supported sources are PNG, JPEG, static WebP, animated WebP, and video
+ * formats with an FFmpeg decoder. The caller owns the source bytes; the
+ * returned value owns the encoded output bytes.
  */
 [[nodiscard]] StickerResult transcode(
     std::span<const std::uint8_t> source,

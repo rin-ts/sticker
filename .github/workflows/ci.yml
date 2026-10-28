@@ -18,7 +18,7 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes cmake pkg-config libpng-dev libjpeg-dev libwebp-dev
+          sudo apt-get install --yes cmake pkg-config libpng-dev libjpeg-dev libwebp-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
       - name: Install Bun dependencies
         run: bun install --frozen-lockfile
       - name: Test

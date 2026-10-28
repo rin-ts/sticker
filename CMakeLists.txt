@@ -23,6 +23,12 @@ pkg_check_modules(WEBP REQUIRED IMPORTED_TARGET
   libwebpmux
   libwebpdemux
 )
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+  libavformat
+  libavcodec
+  libavutil
+  libswscale
+)
 
 add_library(sticker_native_core STATIC
   src/native/sticker_pipeline.cpp
@@ -34,6 +40,7 @@ target_link_libraries(sticker_native_core PUBLIC
   JPEG::JPEG
   PNG::PNG
   PkgConfig::WEBP
+  PkgConfig::FFMPEG
 )
 sticker_enable_warnings(sticker_native_core)
 
