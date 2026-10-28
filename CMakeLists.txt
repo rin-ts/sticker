@@ -56,7 +56,13 @@ add_executable(sticker_native_tests
 target_link_libraries(sticker_native_tests PRIVATE sticker_native_core)
 sticker_enable_warnings(sticker_native_tests)
 
-set_target_properties(sticker_worker sticker_native_tests PROPERTIES
+add_executable(sticker_benchmark_fixtures
+  benchmarks/fixture_builder.cpp
+)
+target_link_libraries(sticker_benchmark_fixtures PRIVATE sticker_native_core)
+sticker_enable_warnings(sticker_benchmark_fixtures)
+
+set_target_properties(sticker_worker sticker_native_tests sticker_benchmark_fixtures PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 

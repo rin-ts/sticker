@@ -22,7 +22,10 @@ constexpr std::array<Byte, 4U> kResponseMagic = {'S', 'T', 'R', '1'};
 constexpr Byte kProtocolVersion = 1U;
 constexpr Byte kCommandTranscode = 1U;
 constexpr Byte kTrimFlag = 1U << 0U;
-constexpr Byte kUnsupportedRequestFlags = static_cast<Byte>(~kTrimFlag);
+constexpr Byte kPreferLosslessFlag = 1U << 1U;
+constexpr Byte kSupportedRequestFlags = kTrimFlag | kPreferLosslessFlag;
+constexpr Byte kUnsupportedRequestFlags =
+    static_cast<Byte>(~kSupportedRequestFlags);
 constexpr std::size_t kRequestHeaderSize = 18U;
 constexpr std::size_t kResponseHeaderSize = 26U;
 constexpr std::size_t kMaximumFrameBytes =
@@ -166,6 +169,7 @@ void write_u32(
                       .blue = frame[12U],
                       .alpha = frame[13U],
                   },
+              .prefer_lossless = (flags & kPreferLosslessFlag) != 0,
           },
       .input = std::vector<Byte>(
           frame.begin() + static_cast<std::ptrdiff_t>(kRequestHeaderSize),

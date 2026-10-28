@@ -23,6 +23,8 @@
   },
   "scripts": {
     "build:native": "bun run scripts/build-native.ts",
+    "benchmark:fixtures": "bun run build:native && bun run benchmarks/generate-fixtures.ts",
+    "benchmark": "bun run benchmark:fixtures && bun run benchmarks/benchmark.ts",
     "test": "bun run typecheck && bun run test:native",
     "test:native": "bun run build:native && ctest --test-dir build/native --output-on-failure && bun test ./tests/native_bridge.test.ts",
     "typecheck": "bun check"

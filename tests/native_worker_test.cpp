@@ -363,6 +363,32 @@ void test_jpeg_transcode() {
           "JPEG output exceeds the WhatsApp size limit");
 }
 
+void test_static_encoding_preferences() {
+  const std::vector<Byte> source = encode_two_color_source();
+  const sticker::StickerResult fast =
+      sticker::transcode(source, sticker::TranscodeOptions{
+                                     .trim = false,
+                                 });
+  const sticker::StickerResult lossless =
+      sticker::transcode(source, sticker::TranscodeOptions{
+                                     .trim = false,
+                                     .prefer_lossless = true,
+                                 });
+
+  WebPBitstreamFeatures fast_features{};
+  WebPBitstreamFeatures lossless_features{};
+  require(WebPGetFeatures(fast.bytes.data(), fast.bytes.size(),
+                          &fast_features) == VP8_STATUS_OK,
+          "unable to inspect fast static output");
+  require(WebPGetFeatures(lossless.bytes.data(), lossless.bytes.size(),
+                          &lossless_features) == VP8_STATUS_OK,
+          "unable to inspect lossless static output");
+  require(fast_features.format == 1,
+          "default static output did not use lossy WebP encoding");
+  require(lossless_features.format == 2,
+          "lossless static preference did not use lossless WebP encoding");
+}
+
 void test_malformed_jpeg_is_rejected() {
   const std::array<Byte, 3U> malformed = {0xffU, 0xd8U, 0xffU};
   try {
@@ -467,9 +493,10 @@ int main(const int argc, char *const argv[]) {
       std::string_view name;
       void (*run)();
     };
-    constexpr std::array<TestCase, 8U> kTestCases = {
+    constexpr std::array<TestCase, 9U> kTestCases = {
         TestCase{"static", test_static_transcode},
         TestCase{"jpeg", test_jpeg_transcode},
+        TestCase{"encoding-preferences", test_static_encoding_preferences},
         TestCase{"malformed-jpeg", test_malformed_jpeg_is_rejected},
         TestCase{"animated", test_animated_transcode},
         TestCase{"video", test_video_transcode},

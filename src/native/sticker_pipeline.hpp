@@ -40,6 +40,7 @@ struct TranscodeOptions {
   std::uint8_t alpha_threshold = 0U;
   std::uint8_t outline_width = 0U;
   RgbaColor outline_color{};
+  bool prefer_lossless = false;
 };
 
 struct StickerResult {

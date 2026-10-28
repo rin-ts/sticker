@@ -14,10 +14,10 @@ const onePixelPng = new Uint8Array(
   ),
 );
 
-test("native worker frames sequential WebP transcodes using the default local worker", async () => {
+test("native worker frames sequential WebP transcodes with fast and lossless preferences", async () => {
   const worker = createNativeStickerWorker();
   try {
-    const [plain, outlined] = await Promise.all([
+    const [plain, outlined, lossless] = await Promise.all([
       worker.transcode(onePixelPng),
       worker.transcode(onePixelPng, {
         outline: {
@@ -25,9 +25,10 @@ test("native worker frames sequential WebP transcodes using the default local wo
           color: { red: 255, green: 0, blue: 0 },
         },
       }),
+      worker.transcode(onePixelPng, { preferLossless: true }),
     ]);
 
-    for (const result of [plain, outlined]) {
+    for (const result of [plain, outlined, lossless]) {
       expect(result.width).toBe(512);
       expect(result.height).toBe(512);
       expect(result.frameCount).toBe(1);

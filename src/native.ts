@@ -8,6 +8,7 @@ const RESPONSE_MAGIC = "STR1";
 const PROTOCOL_VERSION = 1;
 const COMMAND_TRANSCODE = 1;
 const TRIM_FLAG = 1 << 0;
+const PREFER_LOSSLESS_FLAG = 1 << 1;
 const REQUEST_HEADER_BYTES = 18;
 const RESPONSE_HEADER_BYTES = 26;
 const FRAME_LENGTH_BYTES = 4;
@@ -20,6 +21,15 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const textDecoder = new TextDecoder("utf-8", { fatal: true });
 
 type WorkerProcess = Bun.Subprocess<"pipe", "pipe", "ignore">;
+
+type Uint8ArrayReadResult =
+  | { readonly done: true; readonly value?: Uint8Array }
+  | { readonly done: false; readonly value: Uint8Array };
+
+interface Uint8ArrayReader {
+  read(): Promise<Uint8ArrayReadResult>;
+  cancel(reason?: unknown): Promise<void>;
+}
 
 interface WorkerSession {
   readonly process: WorkerProcess;
@@ -53,6 +63,12 @@ export interface NativeStickerTranscodeOptions {
   readonly alphaThreshold?: number;
   /** Optional outline rendered behind the source image. */
   readonly outline?: OutlineOptions;
+  /**
+   * Attempt lossless WebP output before lossy encoding for static results.
+   * Defaults to false because it can take substantially longer for transparent
+   * artwork and still falls back to lossy output when it exceeds the size limit.
+   */
+  readonly preferLossless?: boolean;
   /**
    * Per-request deadline, including writes and reading the complete response.
    * A timed-out worker is killed and a fresh worker is used for a later call.
@@ -126,7 +142,7 @@ class WorkerProtocolError extends NativeStickerWorkerTransportError {
 }
 
 class BufferedReader {
-  readonly #reader: ReadableStreamDefaultReader<Uint8Array>;
+  readonly #reader: Uint8ArrayReader;
   #current: Uint8Array | undefined;
   #offset = 0;
 
@@ -249,6 +265,12 @@ function encodeRequest(
   if (options.trim !== undefined && typeof options.trim !== "boolean") {
     throw new TypeError("trim must be a boolean.");
   }
+  if (
+    options.preferLossless !== undefined
+    && typeof options.preferLossless !== "boolean"
+  ) {
+    throw new TypeError("preferLossless must be a boolean.");
+  }
 
   const input = sourceBytes(source);
   if (input.byteLength > MAXIMUM_SOURCE_BYTES) {
@@ -277,7 +299,9 @@ function encodeRequest(
   frame[header + 3] = REQUEST_MAGIC.charCodeAt(3);
   frame[header + 4] = PROTOCOL_VERSION;
   frame[header + 5] = COMMAND_TRANSCODE;
-  frame[header + 6] = (options.trim ?? true) ? TRIM_FLAG : 0;
+  frame[header + 6] =
+    ((options.trim ?? true) ? TRIM_FLAG : 0)
+    | ((options.preferLossless ?? false) ? PREFER_LOSSLESS_FLAG : 0);
   frame[header + 7] = 0;
   frame[header + 8] = alphaThreshold;
   frame[header + 9] = outlineWidth;

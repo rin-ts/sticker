@@ -1379,11 +1379,14 @@ private:
     }
   } else {
     config.lossless = 0;
-    config.method = 6;
+    // The default static path favors bounded latency. Transparent artwork can
+    // spend seconds optimizing a lossless-quality alpha plane at method 6.
+    // Method 4 keeps alpha edges exact without exhaustive analysis.
+    config.method = 4;
     config.alpha_quality = 100;
     config.thread_level = 1;
     config.exact = 0;
-    config.use_sharp_yuv = 1;
+    config.use_sharp_yuv = 0;
   }
   if (WebPValidateConfig(&config) == 0) {
     fail(ErrorCode::kInternal, "invalid WebP encoder configuration");
@@ -1452,10 +1455,14 @@ encode_static(const Image &image, const int quality, const bool lossless) {
   };
 }
 
-[[nodiscard]] StickerResult encode_static_limited(const Image &image) {
-  std::vector<Byte> encoded = encode_static(image, 100, true);
-  if (encoded.size() <= kMaximumStaticStickerBytes) {
-    return validate_output(std::move(encoded), false);
+[[nodiscard]] StickerResult encode_static_limited(const Image &image,
+                                                  const bool prefer_lossless) {
+  std::vector<Byte> encoded;
+  if (prefer_lossless) {
+    encoded = encode_static(image, 100, true);
+    if (encoded.size() <= kMaximumStaticStickerBytes) {
+      return validate_output(std::move(encoded), false);
+    }
   }
 
   constexpr std::array<int, 9U> kQualityCandidates = {90, 80, 70, 60, 50,
@@ -1804,7 +1811,7 @@ encode_video_animation_limited(const std::span<const Byte> source,
   Image rendered =
       render_frame(decoded.rgba, decoded.width, decoded.height, geometry);
   apply_outline(rendered, options);
-  return encode_static_limited(rendered);
+  return encode_static_limited(rendered, options.prefer_lossless);
 }
 
 [[nodiscard]] StickerResult
@@ -1812,8 +1819,10 @@ transcode_animated_webp(const std::span<const Byte> source,
                         const WebpInfo &info, const TranscodeOptions &options) {
   const AnimationPlan plan = plan_animation(source, info, options);
   if (plan.selections.size() == 1U) {
-    return encode_static_limited(render_animation_frame(
-        source, info, plan, plan.selections.front().source_index, options));
+    return encode_static_limited(
+        render_animation_frame(source, info, plan,
+                               plan.selections.front().source_index, options),
+        options.prefer_lossless);
   }
   return encode_animation_limited(source, info, plan, options);
 }
@@ -1824,8 +1833,10 @@ transcode_animated_video(const std::span<const Byte> source,
                          const TranscodeOptions &options) {
   const AnimationPlan plan = plan_video_animation(source, info, options);
   if (plan.selections.size() == 1U) {
-    return encode_static_limited(render_video_animation_frame(
-        source, info, plan, plan.selections.front().source_index, options));
+    return encode_static_limited(
+        render_video_animation_frame(
+            source, info, plan, plan.selections.front().source_index, options),
+        options.prefer_lossless);
   }
   return encode_video_animation_limited(source, info, plan, options);
 }
