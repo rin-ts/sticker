@@ -1,24 +1,29 @@
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { OutlineOptions, RgbaColor } from "./types.ts";
+import type { ExifOptions, OutlineOptions, RgbaColor } from "./types.ts";
 
 const REQUEST_MAGIC = "STK1";
 const RESPONSE_MAGIC = "STR1";
-const PROTOCOL_VERSION = 1;
+const RESPONSE_PROTOCOL_VERSION = 1;
+const EXIF_REQUEST_PROTOCOL_VERSION = 2;
 const COMMAND_TRANSCODE = 1;
 const TRIM_FLAG = 1 << 0;
 const PREFER_LOSSLESS_FLAG = 1 << 1;
 const REQUEST_HEADER_BYTES = 18;
+const EXIF_REQUEST_HEADER_BYTES = 22;
 const RESPONSE_HEADER_BYTES = 26;
 const FRAME_LENGTH_BYTES = 4;
 const MAXIMUM_FRAME_BYTES = 17 * 1024 * 1024;
 const MAXIMUM_SOURCE_BYTES = 16 * 1024 * 1024;
+const MAXIMUM_EXIF_METADATA_BYTES = 4 * 1024;
+const MAXIMUM_EXIF_MUX_OVERHEAD_BYTES = 128;
 const MAXIMUM_STATIC_STICKER_BYTES = 100 * 1024;
 const MAXIMUM_ANIMATED_STICKER_BYTES = 500 * 1024;
 const MAXIMUM_ANIMATION_DURATION_MS = 10_000;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const textDecoder = new TextDecoder("utf-8", { fatal: true });
+const textEncoder = new TextEncoder();
 
 type WorkerProcess = Bun.Subprocess<"pipe", "pipe", "ignore">;
 
@@ -35,6 +40,11 @@ interface WorkerSession {
   readonly process: WorkerProcess;
   readonly stdin: WorkerProcess["stdin"];
   readonly reader: BufferedReader;
+}
+
+interface EncodedRequest {
+  readonly frame: Uint8Array;
+  readonly exifMetadataBytes: number;
 }
 
 /**
@@ -69,6 +79,8 @@ export interface NativeStickerTranscodeOptions {
    * artwork and still falls back to lossy output when it exceeds the size limit.
    */
   readonly preferLossless?: boolean;
+  /** Optional WhatsApp sticker-pack metadata written as a WebP EXIF chunk. */
+  readonly exif?: ExifOptions;
   /**
    * Per-request deadline, including writes and reading the complete response.
    * A timed-out worker is killed and a fresh worker is used for a later call.
@@ -258,10 +270,44 @@ function encodeColor(color: RgbaColor): readonly [number, number, number, number
   ];
 }
 
+function encodeExif(exif: ExifOptions | undefined): Uint8Array | undefined {
+  if (exif === undefined) {
+    return undefined;
+  }
+  if (typeof exif !== "object" || exif === null) {
+    throw new TypeError("exif must be an object.");
+  }
+  if (typeof exif.packId !== "string" || exif.packId.length === 0) {
+    throw new TypeError("exif.packId must be a non-empty string.");
+  }
+  if (typeof exif.packName !== "string" || exif.packName.length === 0) {
+    throw new TypeError("exif.packName must be a non-empty string.");
+  }
+  if (
+    exif.emojis !== undefined
+    && (!Array.isArray(exif.emojis)
+      || exif.emojis.some((emoji) => typeof emoji !== "string"))
+  ) {
+    throw new TypeError("exif.emojis must be an array of strings.");
+  }
+
+  const encoded = textEncoder.encode(JSON.stringify({
+    "sticker-pack-id": exif.packId,
+    "sticker-pack-name": exif.packName,
+    emojis: exif.emojis ?? [],
+  }));
+  if (encoded.byteLength === 0 || encoded.byteLength > MAXIMUM_EXIF_METADATA_BYTES) {
+    throw new RangeError(
+      `EXIF metadata must contain from 1 through ${MAXIMUM_EXIF_METADATA_BYTES} UTF-8 bytes.`,
+    );
+  }
+  return encoded;
+}
+
 function encodeRequest(
   source: NativeStickerSource,
   options: NativeStickerTranscodeOptions,
-): Uint8Array {
+): EncodedRequest {
   if (options.trim !== undefined && typeof options.trim !== "boolean") {
     throw new TypeError("trim must be a boolean.");
   }
@@ -287,17 +333,23 @@ function encodeRequest(
   const color = encodeColor(
     options.outline?.color ?? { red: 255, green: 255, blue: 255, alpha: 255 },
   );
+  const exif = encodeExif(options.exif);
+  const requestHeaderBytes =
+    exif === undefined ? REQUEST_HEADER_BYTES : EXIF_REQUEST_HEADER_BYTES;
 
-  const frame = new Uint8Array(FRAME_LENGTH_BYTES + REQUEST_HEADER_BYTES + input.byteLength);
+  const frame = new Uint8Array(
+    FRAME_LENGTH_BYTES + requestHeaderBytes + input.byteLength + (exif?.byteLength ?? 0),
+  );
   const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
-  view.setUint32(0, REQUEST_HEADER_BYTES + input.byteLength, true);
+  view.setUint32(0, requestHeaderBytes + input.byteLength + (exif?.byteLength ?? 0), true);
 
   const header = FRAME_LENGTH_BYTES;
   frame[header] = REQUEST_MAGIC.charCodeAt(0);
   frame[header + 1] = REQUEST_MAGIC.charCodeAt(1);
   frame[header + 2] = REQUEST_MAGIC.charCodeAt(2);
   frame[header + 3] = REQUEST_MAGIC.charCodeAt(3);
-  frame[header + 4] = PROTOCOL_VERSION;
+  frame[header + 4] =
+    exif === undefined ? RESPONSE_PROTOCOL_VERSION : EXIF_REQUEST_PROTOCOL_VERSION;
   frame[header + 5] = COMMAND_TRANSCODE;
   frame[header + 6] =
     ((options.trim ?? true) ? TRIM_FLAG : 0)
@@ -310,11 +362,23 @@ function encodeRequest(
   frame[header + 12] = color[2];
   frame[header + 13] = color[3];
   view.setUint32(header + 14, input.byteLength, true);
-  frame.set(input, header + REQUEST_HEADER_BYTES);
-  return frame;
+  if (exif !== undefined) {
+    view.setUint32(header + 18, exif.byteLength, true);
+  }
+  frame.set(input, header + requestHeaderBytes);
+  if (exif !== undefined) {
+    frame.set(exif, header + requestHeaderBytes + input.byteLength);
+  }
+  return {
+    frame,
+    exifMetadataBytes: exif?.byteLength ?? 0,
+  };
 }
 
-function decodeResponse(frame: Uint8Array): NativeStickerResult {
+function decodeResponse(
+  frame: Uint8Array,
+  exifMetadataBytes: number,
+): NativeStickerResult {
   if (frame.byteLength < RESPONSE_HEADER_BYTES) {
     throw new WorkerProtocolError("Sticker worker response is shorter than its header.");
   }
@@ -325,7 +389,7 @@ function decodeResponse(frame: Uint8Array): NativeStickerResult {
       throw new WorkerProtocolError("Sticker worker response has an invalid magic value.");
     }
   }
-  if (view.getUint8(4) !== PROTOCOL_VERSION) {
+  if (view.getUint8(4) !== RESPONSE_PROTOCOL_VERSION) {
     throw new WorkerProtocolError("Sticker worker response uses an unsupported protocol version.");
   }
 
@@ -389,9 +453,12 @@ function decodeResponse(frame: Uint8Array): NativeStickerResult {
   if (isAnimated && durationMs > MAXIMUM_ANIMATION_DURATION_MS) {
     throw new WorkerProtocolError("Sticker worker returned an overlong animation.");
   }
-  const outputLimit = isAnimated
+  const stickerLimit = isAnimated
     ? MAXIMUM_ANIMATED_STICKER_BYTES
     : MAXIMUM_STATIC_STICKER_BYTES;
+  const outputLimit = stickerLimit + (exifMetadataBytes === 0
+    ? 0
+    : exifMetadataBytes + MAXIMUM_EXIF_MUX_OVERHEAD_BYTES);
   if (outputBytes > outputLimit) {
     throw new WorkerProtocolError("Sticker worker returned an oversized WebP.");
   }
@@ -466,7 +533,11 @@ export class NativeStickerWorker {
 
     const request = encodeRequest(source, options);
     const timeoutMs = requireTimeout(options.timeoutMs ?? this.#defaultTimeoutMs, "timeoutMs");
-    const work = this.#tail.then(() => this.#transcode(request, timeoutMs));
+    const work = this.#tail.then(() => this.#transcode(
+      request.frame,
+      timeoutMs,
+      request.exifMetadataBytes,
+    ));
     this.#tail = work.then(
       () => undefined,
       () => undefined,
@@ -532,10 +603,17 @@ export class NativeStickerWorker {
     void session.process.exited.catch(() => undefined);
   }
 
-  async #transcode(request: Uint8Array, timeoutMs: number): Promise<NativeStickerResult> {
+  async #transcode(
+    request: Uint8Array,
+    timeoutMs: number,
+    exifMetadataBytes: number,
+  ): Promise<NativeStickerResult> {
     const session = this.#session ?? this.#startSession();
     try {
-      return await withTimeout(this.#exchange(session, request), timeoutMs);
+      return await withTimeout(
+        this.#exchange(session, request, exifMetadataBytes),
+        timeoutMs,
+      );
     } catch (error) {
       if (!(error instanceof NativeStickerWorkerError)) {
         this.#discardSession(session);
@@ -544,7 +622,11 @@ export class NativeStickerWorker {
     }
   }
 
-  async #exchange(session: WorkerSession, request: Uint8Array): Promise<NativeStickerResult> {
+  async #exchange(
+    session: WorkerSession,
+    request: Uint8Array,
+    exifMetadataBytes: number,
+  ): Promise<NativeStickerResult> {
     if (session.process.exitCode !== null) {
       throw new NativeStickerWorkerTransportError("Sticker worker exited before it accepted a request.");
     }
@@ -558,7 +640,7 @@ export class NativeStickerWorker {
       throw new WorkerProtocolError("Sticker worker response frame exceeds protocol limits.");
     }
     const response = await session.reader.readExactly(responseLength);
-    return decodeResponse(response);
+    return decodeResponse(response, exifMetadataBytes);
   }
 }
 

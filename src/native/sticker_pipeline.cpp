@@ -61,6 +61,10 @@ constexpr std::size_t kMaximumStaticStickerBytes =
     static_cast<std::size_t>(100U) * 1024U;
 constexpr std::size_t kMaximumAnimatedStickerBytes =
     static_cast<std::size_t>(500U) * 1024U;
+constexpr std::size_t kMaximumExifMetadataBytes =
+    static_cast<std::size_t>(4U) * 1024U;
+// Allows the RIFF EXIF chunk, alignment, and a VP8X chunk when muxing adds it.
+constexpr std::size_t kMaximumExifMuxOverheadBytes = 128U;
 constexpr std::uint8_t kMaximumOutlineWidth = 64U;
 constexpr int kDistanceInfinity = 1 << 26;
 
@@ -1408,8 +1412,58 @@ encode_static(const Image &image, const int quality, const bool lossless) {
   return writer.copy();
 }
 
+[[nodiscard]] std::vector<Byte>
+inject_exif(const std::vector<Byte> &encoded,
+            const std::span<const Byte> metadata_json) {
+  if (metadata_json.empty() ||
+      metadata_json.size() > kMaximumExifMetadataBytes) {
+    fail(ErrorCode::kInvalidInput, "invalid sticker EXIF metadata");
+  }
+
+  constexpr std::array<Byte, 22U> kExifHeader = {
+      0x49U, 0x49U, 0x2aU, 0x00U, 0x08U, 0x00U, 0x00U, 0x00U,
+      0x01U, 0x00U, 0x41U, 0x57U, 0x07U, 0x00U, 0x00U, 0x00U,
+      0x00U, 0x00U, 0x16U, 0x00U, 0x00U, 0x00U,
+  };
+  std::vector<Byte> exif(kExifHeader.size() + metadata_json.size());
+  std::copy(kExifHeader.begin(), kExifHeader.end(), exif.begin());
+  std::copy(metadata_json.begin(), metadata_json.end(),
+            exif.begin() + static_cast<std::ptrdiff_t>(kExifHeader.size()));
+  const std::uint32_t json_size =
+      static_cast<std::uint32_t>(metadata_json.size());
+  exif[14U] = static_cast<Byte>(json_size & 0xffU);
+  exif[15U] = static_cast<Byte>((json_size >> 8U) & 0xffU);
+  exif[16U] = static_cast<Byte>((json_size >> 16U) & 0xffU);
+  exif[17U] = static_cast<Byte>((json_size >> 24U) & 0xffU);
+
+  const WebPData input = {
+      .bytes = encoded.data(),
+      .size = encoded.size(),
+  };
+  std::unique_ptr<WebPMux, decltype(&WebPMuxDelete)> mux(
+      WebPMuxCreate(&input, 1), &WebPMuxDelete);
+  if (mux == nullptr) {
+    fail(ErrorCode::kEncodingFailed, "unable to create WebP metadata mux");
+  }
+  const WebPData chunk = {
+      .bytes = exif.data(),
+      .size = exif.size(),
+  };
+  if (WebPMuxSetChunk(mux.get(), "EXIF", &chunk, 1) != WEBP_MUX_OK) {
+    fail(ErrorCode::kEncodingFailed, "unable to attach WebP EXIF metadata");
+  }
+
+  EncodedData assembled;
+  if (WebPMuxAssemble(mux.get(), assembled.get()) != WEBP_MUX_OK) {
+    fail(ErrorCode::kEncodingFailed,
+         "unable to assemble WebP with EXIF metadata");
+  }
+  return assembled.copy();
+}
+
 [[nodiscard]] StickerResult validate_output(std::vector<Byte> bytes,
-                                            const bool expect_animation) {
+                                            const bool expect_animation,
+                                            const std::size_t byte_limit) {
   if (bytes.empty()) {
     fail(ErrorCode::kEncodingFailed, "WebP encoder returned no output");
   }
@@ -1438,11 +1492,9 @@ encode_static(const Image &image, const int quality, const bool lossless) {
          "encoded WebP animation exceeds 10 seconds");
   }
 
-  const std::size_t limit =
-      animated ? kMaximumAnimatedStickerBytes : kMaximumStaticStickerBytes;
-  if (bytes.size() > limit) {
+  if (bytes.size() > byte_limit) {
     fail(ErrorCode::kValidationFailed,
-         "encoded WebP exceeds the WhatsApp size limit");
+         "encoded WebP exceeds the permitted output size");
   }
 
   return StickerResult{
@@ -1461,7 +1513,8 @@ encode_static(const Image &image, const int quality, const bool lossless) {
   if (prefer_lossless) {
     encoded = encode_static(image, 100, true);
     if (encoded.size() <= kMaximumStaticStickerBytes) {
-      return validate_output(std::move(encoded), false);
+      return validate_output(std::move(encoded), false,
+                             kMaximumStaticStickerBytes);
     }
   }
 
@@ -1470,7 +1523,8 @@ encode_static(const Image &image, const int quality, const bool lossless) {
   for (const int quality : kQualityCandidates) {
     encoded = encode_static(image, quality, false);
     if (encoded.size() <= kMaximumStaticStickerBytes) {
-      return validate_output(std::move(encoded), false);
+      return validate_output(std::move(encoded), false,
+                             kMaximumStaticStickerBytes);
     }
   }
   fail(ErrorCode::kEncodingFailed,
@@ -1629,7 +1683,8 @@ encode_animation_limited(const std::span<const Byte> source,
     std::vector<Byte> encoded =
         encode_animation(source, info, plan, options, quality);
     if (encoded.size() <= kMaximumAnimatedStickerBytes) {
-      return validate_output(std::move(encoded), true);
+      return validate_output(std::move(encoded), true,
+                             kMaximumAnimatedStickerBytes);
     }
   }
   fail(ErrorCode::kEncodingFailed,
@@ -1790,7 +1845,8 @@ encode_video_animation_limited(const std::span<const Byte> source,
     std::vector<Byte> encoded =
         encode_video_animation(source, info, plan, options, quality);
     if (encoded.size() <= kMaximumAnimatedStickerBytes) {
-      return validate_output(std::move(encoded), true);
+      return validate_output(std::move(encoded), true,
+                             kMaximumAnimatedStickerBytes);
     }
   }
   fail(ErrorCode::kEncodingFailed,
@@ -1857,29 +1913,42 @@ StickerResult transcode(const std::span<const std::uint8_t> source,
       fail(ErrorCode::kInvalidInput,
            "outline width is outside the supported range");
     }
+    if (options.exif_json.has_value() &&
+        (options.exif_json->empty() ||
+         options.exif_json->size() > kMaximumExifMetadataBytes)) {
+      fail(ErrorCode::kInvalidInput, "invalid sticker EXIF metadata");
+    }
 
+    StickerResult result;
     if (is_webp(source)) {
       const WebpInfo info = inspect_webp(source);
       if (info.animated()) {
-        return transcode_animated_webp(source, info, options);
+        result = transcode_animated_webp(source, info, options);
+      } else {
+        result = transcode_static(decode_static_webp(source, info), options);
       }
-      return transcode_static(decode_static_webp(source, info), options);
-    }
-    if (is_png(source)) {
+    } else if (is_png(source)) {
       if (is_apng(source)) {
         fail(ErrorCode::kUnsupportedInput,
              "APNG input is not supported; convert it to WebP first");
       }
-      return transcode_static(decode_png(source), options);
-    }
-    if (is_jpeg(source)) {
-      return transcode_static(decode_jpeg(source), options);
-    }
-    if (is_gif(source)) {
+      result = transcode_static(decode_png(source), options);
+    } else if (is_jpeg(source)) {
+      result = transcode_static(decode_jpeg(source), options);
+    } else if (is_gif(source)) {
       fail(ErrorCode::kUnsupportedInput,
            "GIF input is not supported; use a video or animated WebP instead");
+    } else {
+      result = transcode_animated_video(source, inspect_video(source), options);
     }
-    return transcode_animated_video(source, inspect_video(source), options);
+    if (options.exif_json.has_value()) {
+      return validate_output(
+          inject_exif(result.bytes, *options.exif_json), result.animated,
+          (result.animated ? kMaximumAnimatedStickerBytes
+                           : kMaximumStaticStickerBytes) +
+              options.exif_json->size() + kMaximumExifMuxOverheadBytes);
+    }
+    return result;
   } catch (const StickerError &) {
     throw;
   } catch (const std::bad_alloc &) {

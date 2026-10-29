@@ -10,6 +10,7 @@ export {
 export type {
   OutlineOptions,
   RgbaColor,
+  ExifOptions,
 } from "./types.ts";
 
 export type {

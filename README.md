@@ -11,9 +11,10 @@ TypeScript API sends bytes and returns validated sticker bytes.
 ## Highlights
 
 - PNG, JPEG, static WebP, animated WebP, and FFmpeg-decoded video input
-- 512 × 512 static or animated WebP output validated against conservative
-  WhatsApp sticker limits
+- 512 × 512 static or animated WebP output with image payloads bounded to
+  conservative WhatsApp sticker limits
 - Alpha trimming, proportional sizing, and alpha-aware outlines
+- Optional WhatsApp sticker-pack EXIF metadata, muxed with `libwebpmux`
 - Fast high-quality lossy output by default, with an opt-in lossless static attempt
 - Persistent workers, per-request deadlines, bounded input, and automatic
   worker replacement after a transport failure or timeout
@@ -29,7 +30,7 @@ Pass `workerPath` only when using a custom native worker executable.
 Keep a custom worker on the same package version as its TypeScript wrapper. A
 newer wrapper can send ordinary requests to an older worker, but that worker
 keeps its older encoding default; `preferLossless: true` is rejected by an
-older worker.
+older worker. `exif` also requires a matching worker version.
 
 ## Quick start
 
@@ -47,6 +48,11 @@ const sticker = await worker.transcode(source, {
   outline: {
     width: 8,
     color: { red: 255, green: 255, blue: 255, alpha: 255 },
+  },
+  exif: {
+    packId: "com.example.my-pack",
+    packName: "My Sticker Pack",
+    emojis: ["✨"],
   },
 });
 
@@ -94,6 +100,7 @@ view. `options` are:
 | `outline.width` | `0` | Outline radius, from 0 through 64 pixels |
 | `outline.color` | opaque white | `{ red, green, blue, alpha? }`, each channel 0 through 255 |
 | `preferLossless` | `false` | Attempt lossless static WebP before lossy fallback; it still falls back when output exceeds 100 KiB |
+| `exif` | none | Optional `{ packId, packName, emojis? }` metadata written to WebP EXIF; `packId` and `packName` must be nonempty strings, and encoded JSON is limited to 4 KiB |
 | `timeoutMs` | worker default (30,000 ms) | Deadline for writing, conversion, and reading the response |
 
 Calls to one worker are intentionally serialized. Use a finite pool of workers
@@ -104,9 +111,11 @@ accepted work, and terminates the child process.
 
 - Source assets are limited to 16 MiB.
 - Output is always 512 × 512 WebP.
-- Static output is limited to 100 KiB.
-- Animated output is limited to 500 KiB, 10 seconds, and requires multiple
-  frames with delays of at least 8 ms.
+- Static image data is limited to 100 KiB; optional EXIF adds at most 4 KiB
+  plus WebP container overhead to the final file.
+- Animated image data is limited to 500 KiB, 10 seconds, and requires
+  multiple frames with delays of at least 8 ms. Optional EXIF adds the same
+  bounded overhead.
 
 The worker is discarded after a timeout, malformed protocol response, or
 transport failure; the next queued call starts a clean process. Still enforce

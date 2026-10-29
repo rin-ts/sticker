@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -19,12 +20,12 @@ enum class ErrorCode : std::uint8_t {
 };
 
 class StickerError final : public std::runtime_error {
- public:
+public:
   StickerError(ErrorCode code, std::string message);
 
   [[nodiscard]] ErrorCode code() const noexcept;
 
- private:
+private:
   ErrorCode code_;
 };
 
@@ -41,6 +42,8 @@ struct TranscodeOptions {
   std::uint8_t outline_width = 0U;
   RgbaColor outline_color{};
   bool prefer_lossless = false;
+  // UTF-8 JSON payload for WhatsApp's WebP EXIF sticker metadata, up to 4 KiB.
+  std::optional<std::vector<std::uint8_t>> exif_json;
 };
 
 struct StickerResult {
@@ -59,8 +62,7 @@ struct StickerResult {
  * formats with an FFmpeg decoder. The caller owns the source bytes; the
  * returned value owns the encoded output bytes.
  */
-[[nodiscard]] StickerResult transcode(
-    std::span<const std::uint8_t> source,
-    const TranscodeOptions& options);
+[[nodiscard]] StickerResult transcode(std::span<const std::uint8_t> source,
+                                      const TranscodeOptions &options);
 
-}  // namespace sticker
+} // namespace sticker

@@ -99,6 +99,40 @@ struct AvFrameDeleter {
   return result;
 }
 
+[[nodiscard]] std::vector<Byte> encode_exif_boundary_source() {
+  constexpr int kWidth = 512;
+  constexpr int kHeight = 512;
+  constexpr std::uint32_t kDetail = 32U;
+  std::vector<Byte> pixels(static_cast<std::size_t>(kWidth) * kHeight * 4U);
+  std::uint32_t state = 0x12345678U;
+  for (int y = 0; y < kHeight; ++y) {
+    for (int x = 0; x < kWidth; ++x) {
+      state = state * 1664525U + 1013904223U;
+      const std::uint32_t base = (static_cast<std::uint32_t>(x) * 3U +
+                                  static_cast<std::uint32_t>(y) * 5U) &
+                                 0xffU;
+      const std::size_t offset =
+          (static_cast<std::size_t>(y) * kWidth + x) * 4U;
+      pixels[offset] =
+          static_cast<Byte>((base + ((state >> 24U) * kDetail >> 8U)) & 0xffU);
+      pixels[offset + 1U] = static_cast<Byte>(
+          (base * 3U + (((state >> 16U) & 0xffU) * kDetail >> 8U)) & 0xffU);
+      pixels[offset + 2U] = static_cast<Byte>(
+          (base * 7U + (((state >> 8U) & 0xffU) * kDetail >> 8U)) & 0xffU);
+      pixels[offset + 3U] = 255U;
+    }
+  }
+
+  Byte *encoded = nullptr;
+  const std::size_t encoded_size = WebPEncodeLosslessRGBA(
+      pixels.data(), kWidth, kHeight, kWidth * 4, &encoded);
+  require(encoded_size != 0U && encoded != nullptr,
+          "failed to encode EXIF boundary source");
+  const std::vector<Byte> result(encoded, encoded + encoded_size);
+  WebPFree(encoded);
+  return result;
+}
+
 [[nodiscard]] std::vector<Byte> decode_rgba(const std::vector<Byte> &bytes,
                                             int &width, int &height) {
   std::unique_ptr<Byte, decltype(&WebPFree)> decoded(
@@ -333,6 +367,7 @@ void test_static_transcode() {
                                              .blue = 255U,
                                              .alpha = 255U,
                                          },
+                                     .exif_json = std::nullopt,
                                  });
   require(!result.animated, "static source produced an animated output");
   require(result.width == 512U && result.height == 512U,
@@ -368,11 +403,13 @@ void test_static_encoding_preferences() {
   const sticker::StickerResult fast =
       sticker::transcode(source, sticker::TranscodeOptions{
                                      .trim = false,
+                                     .exif_json = std::nullopt,
                                  });
   const sticker::StickerResult lossless =
       sticker::transcode(source, sticker::TranscodeOptions{
                                      .trim = false,
                                      .prefer_lossless = true,
+                                     .exif_json = std::nullopt,
                                  });
 
   WebPBitstreamFeatures fast_features{};
@@ -420,7 +457,10 @@ void test_animated_transcode() {
 void test_video_transcode() {
   const std::vector<Byte> source = encode_video_source();
   const sticker::StickerResult result =
-      sticker::transcode(source, sticker::TranscodeOptions{.trim = false});
+      sticker::transcode(source, sticker::TranscodeOptions{
+                                     .trim = false,
+                                     .exif_json = std::nullopt,
+                                 });
   require(result.animated, "video source did not produce animated output");
   require(result.width == 512U && result.height == 512U,
           "video output dimensions are not 512 by 512");
@@ -438,6 +478,7 @@ void test_edge_pixels_are_clamped_before_interpolation() {
   const sticker::StickerResult result =
       sticker::transcode(source, sticker::TranscodeOptions{
                                      .trim = false,
+                                     .exif_json = std::nullopt,
                                  });
   int width = 0;
   int height = 0;
@@ -454,6 +495,69 @@ void test_edge_pixels_are_clamped_before_interpolation() {
   require(decoded[right_offset] < 16U && decoded[right_offset + 2U] > 240U &&
               decoded[right_offset + 3U] == 255U,
           "right edge was blended with a pixel outside the source crop");
+}
+
+void test_exif_metadata_is_muxed() {
+  constexpr std::string_view kMetadata =
+      R"({"sticker-pack-id":"test-pack","sticker-pack-name":"Test Pack","emojis":["😀"]})";
+  const sticker::StickerResult result = sticker::transcode(
+      encode_static_source(),
+      sticker::TranscodeOptions{
+          .exif_json = std::vector<Byte>(kMetadata.begin(), kMetadata.end()),
+      });
+
+  const WebPData data = {
+      .bytes = result.bytes.data(),
+      .size = result.bytes.size(),
+  };
+  std::unique_ptr<WebPMux, decltype(&WebPMuxDelete)> mux(
+      WebPMuxCreate(&data, 0), &WebPMuxDelete);
+  require(mux != nullptr, "EXIF output could not be read by WebPMux");
+
+  WebPData exif{};
+  WebPDataInit(&exif);
+  require(WebPMuxGetChunk(mux.get(), "EXIF", &exif) == WEBP_MUX_OK,
+          "EXIF output is missing its metadata chunk");
+  require(exif.size == 22U + kMetadata.size(),
+          "EXIF output has an unexpected metadata length");
+  require(exif.bytes[0U] == 0x49U && exif.bytes[1U] == 0x49U &&
+              exif.bytes[10U] == 0x41U && exif.bytes[11U] == 0x57U,
+          "EXIF output does not use WhatsApp's TIFF prefix");
+  const std::uint32_t json_length =
+      static_cast<std::uint32_t>(exif.bytes[14U]) |
+      (static_cast<std::uint32_t>(exif.bytes[15U]) << 8U) |
+      (static_cast<std::uint32_t>(exif.bytes[16U]) << 16U) |
+      (static_cast<std::uint32_t>(exif.bytes[17U]) << 24U);
+  require(json_length == kMetadata.size(),
+          "EXIF output stores an incorrect JSON payload length");
+  const std::string actual_metadata(
+      reinterpret_cast<const char *>(exif.bytes + 22U), kMetadata.size());
+  require(actual_metadata == kMetadata,
+          "EXIF output stores an unexpected JSON payload: " + actual_metadata);
+}
+
+void test_exif_metadata_can_extend_the_image_budget() {
+  constexpr std::size_t kStaticImageBudget =
+      static_cast<std::size_t>(100U) * 1024U;
+  constexpr std::size_t kMaximumExifMuxOverhead = 128U;
+  std::string metadata =
+      R"({"sticker-pack-id":"test-pack","sticker-pack-name":")";
+  metadata.append(3900U, 'x');
+  metadata += R"(","emojis":[]})";
+  require(metadata.size() <= static_cast<std::size_t>(4U) * 1024U,
+          "EXIF boundary metadata exceeds the supported limit");
+
+  const sticker::StickerResult result = sticker::transcode(
+      encode_exif_boundary_source(),
+      sticker::TranscodeOptions{
+          .trim = false,
+          .exif_json = std::vector<Byte>(metadata.begin(), metadata.end()),
+      });
+  require(result.bytes.size() > kStaticImageBudget,
+          "EXIF metadata did not extend the static image byte budget");
+  require(result.bytes.size() <=
+              kStaticImageBudget + metadata.size() + kMaximumExifMuxOverhead,
+          "EXIF output exceeds its bounded byte budget");
 }
 
 void test_apng_is_explicitly_rejected() {
@@ -493,7 +597,7 @@ int main(const int argc, char *const argv[]) {
       std::string_view name;
       void (*run)();
     };
-    constexpr std::array<TestCase, 9U> kTestCases = {
+    constexpr std::array<TestCase, 11U> kTestCases = {
         TestCase{"static", test_static_transcode},
         TestCase{"jpeg", test_jpeg_transcode},
         TestCase{"encoding-preferences", test_static_encoding_preferences},
@@ -502,6 +606,9 @@ int main(const int argc, char *const argv[]) {
         TestCase{"video", test_video_transcode},
         TestCase{"interpolation",
                  test_edge_pixels_are_clamped_before_interpolation},
+        TestCase{"exif", test_exif_metadata_is_muxed},
+        TestCase{"exif-byte-budget",
+                 test_exif_metadata_can_extend_the_image_budget},
         TestCase{"apng", test_apng_is_explicitly_rejected},
         TestCase{"invalid", test_invalid_input},
     };

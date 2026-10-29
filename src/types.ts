@@ -10,3 +10,10 @@ export interface OutlineOptions {
   /** Outline radius in pixels. */
   readonly width: number;
 }
+
+/** WhatsApp sticker-pack fields written into a WebP EXIF chunk, up to 4 KiB. */
+export interface ExifOptions {
+  readonly packId: string;
+  readonly packName: string;
+  readonly emojis?: readonly string[];
+}
